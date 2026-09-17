@@ -1,329 +1,195 @@
 // ==UserScript==
-// @name         said Kahoot Auto
-// @namespace    said
-// @version      1.0.0
-// @description  Kahoot otomatik doğru cevap — açar açmaz çalışır
-// @author       said
+// @name         Kahoot Said Auto-Answer
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Kahoot Auto-Answer with Draggable UI
 // @match        *://kahoot.it/*
-// @match        *://*.kahoot.it/*
-// @run-at       document-idle
 // @grant        none
+// @run-at       document-start
 // ==/UserScript==
 
-(function () {
-  "use strict";
+(function() {
+    'use strict';
 
-  const CFG = {
-    autoAnswer: true,       // açar açmaz tıkla
-    showAnswers: true,      // doğru şıkları yeşil göster
-    baseDelay: 400,         // ms (çok hızlı = 0 puan riski)
-    randomDelay: 350,       // ± rastgele
-    multiStagger: 60
-  };
-
-  let quizData = null;      // { questions: [...] }
-  let lastQText = "";
-  let lastAnswered = -1;
-
-  // ─── API: public quiz answers ─────────────────────────────────
-  // Challenge / public quiz: rest/challenges/{id}
-  // Classic live: quiz uuid gerekir (host URL veya challenge-id)
-  async function fetchByChallengeId(id) {
-    const urls = [
-      `https://kahoot.it/rest/challenges/${id}`,
-      `https://kahoot.it/rest/challenges/${id}/answers`,
-      `https://create.kahoot.it/rest/kahoots/${id}/card/?includeKahoot=true`
-    ];
-    for (const u of urls) {
-      try {
-        const r = await fetch(u, { credentials: "include" });
-        if (!r.ok) continue;
-        const j = await r.json();
-        const qs = extractQuestions(j);
-        if (qs && qs.length) return qs;
-      } catch (_) {}
-    }
-    return null;
-  }
-
-  function extractQuestions(j) {
-    // multiple response shapes
-    if (j?.kahoot?.questions) return j.kahoot.questions;
-    if (j?.questions) return j.questions;
-    if (j?.challenge?.kahoot?.questions) return j.challenge.kahoot.questions;
-    if (Array.isArray(j)) return j;
-    return null;
-  }
-
-  function getCorrectIndexes(q) {
-    if (!q) return [];
-    const choices = q.choices || q.answers || [];
-    const idxs = [];
-    choices.forEach((c, i) => {
-      if (c.correct === true || c.isCorrect === true) idxs.push(i);
-    });
-    return idxs;
-  }
-
-  function normalize(s) {
-    return String(s || "")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-  }
-
-  function matchQuestion(liveText) {
-    if (!quizData || !quizData.length) return null;
-    const t = normalize(liveText);
-    if (!t) return null;
-    let best = null, bestScore = 0;
-    for (let i = 0; i < quizData.length; i++) {
-      const qt = normalize(quizData[i].question || quizData[i].title || "");
-      if (!qt) continue;
-      if (qt === t) return { q: quizData[i], index: i };
-      // partial
-      if (t.includes(qt.slice(0, 40)) || qt.includes(t.slice(0, 40))) {
-        const score = Math.min(t.length, qt.length);
-        if (score > bestScore) {
-          bestScore = score;
-          best = { q: quizData[i], index: i };
-        }
-      }
-    }
-    return best;
-  }
-
-  // ─── DOM helpers (güncel kahoot selectors) ────────────────────
-  function qSel(sel) {
-    return document.querySelector(`[data-functional-selector="${sel}"]`);
-  }
-
-  function getQuestionText() {
-    const el =
-      qSel("question-title") ||
-      qSel("block-title") ||
-      document.querySelector('[data-functional-selector*="question"]') ||
-      document.querySelector(".question-title, h1, [class*='question']");
-    return el ? el.textContent : "";
-  }
-
-  function getAnswerButtons() {
-    // classic 4-choice + multi
-    let btns = Array.from(
-      document.querySelectorAll(
-        '[data-functional-selector^="answer-"], [data-functional-selector="question-choice"], button[data-functional-selector*="answer"]'
-      )
-    );
-    if (!btns.length) {
-      btns = Array.from(
-        document.querySelectorAll(
-          ".answer, .mcq-answer, [class*='answer-button'], button[class*='choice']"
-        )
-      );
-    }
-    // sadece tıklanabilir görünenler
-    return btns.filter((b) => {
-      const r = b.getBoundingClientRect();
-      return r.width > 20 && r.height > 20 && getComputedStyle(b).visibility !== "hidden";
-    });
-  }
-
-  function highlight(btns, idxs) {
-    btns.forEach((b, i) => {
-      if (idxs.includes(i)) {
-        b.style.outline = "3px solid #00e676";
-        b.style.boxShadow = "0 0 12px #00e676";
-        b.style.zIndex = "5";
-      } else {
-        b.style.outline = "";
-        b.style.boxShadow = "";
-      }
-    });
-  }
-
-  function clickAnswer(btns, idxs) {
-    if (!idxs.length || !btns.length) return;
-    idxs.forEach((i, n) => {
-      setTimeout(() => {
-        const b = btns[i];
-        if (!b) return;
-        b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-        b.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        b.click();
-        b.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-        b.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
-      }, n * CFG.multiStagger);
-    });
-  }
-
-  // ─── main tick ────────────────────────────────────────────────
-  function tick() {
-    const text = getQuestionText();
-    if (!text || text === lastQText) return;
-
-    const match = matchQuestion(text);
-    if (!match) {
-      status("soru eşleşmedi — quiz id lazım");
-      return;
-    }
-
-    lastQText = text;
-    const idxs = getCorrectIndexes(match.q);
-    const btns = getAnswerButtons();
-
-    if (CFG.showAnswers) highlight(btns, idxs);
-
-    if (CFG.autoAnswer && match.index !== lastAnswered && idxs.length) {
-      lastAnswered = match.index;
-      const delay =
-        CFG.baseDelay + Math.floor(Math.random() * (CFG.randomDelay + 1));
-      status(`cevap #${idxs.map((i) => i + 1).join(",")} · ${delay}ms`);
-      setTimeout(() => {
-        const fresh = getAnswerButtons();
-        clickAnswer(fresh.length ? fresh : btns, idxs);
-      }, delay);
-    }
-
-    status(`Q ${match.index + 1}/${quizData.length}`);
-  }
-
-  // ─── auto discover challenge / quiz id from URL ───────────────
-  function discoverId() {
-    const u = location.href;
-    // challenge-id=uuid_timestamp
-    let m = u.match(/challenge-id=([a-f0-9-]{36}_?\d*)/i);
-    if (m) return m[1];
-    m = u.match(/challenge\/([a-f0-9-]{36}(?:_\d+)?)/i);
-    if (m) return m[1];
-    m = u.match(/\/details\/([a-f0-9-]{36})/i);
-    if (m) return m[1];
-    m = u.match(/[?&]quizId=([a-f0-9-]{36})/i);
-    if (m) return m[1];
-    // path uuid
-    m = u.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
-    if (m) return m[1];
-    return null;
-  }
-
-  // ─── intercept network for live quiz payload ──────────────────
-  const _fetch = window.fetch;
-  window.fetch = async function (...args) {
-    const res = await _fetch.apply(this, args);
-    try {
-      const url = String(args[0] || "");
-      if (
-        /kahoot\.it\/rest\/i.test(url) ||
-        /create\.kahoot\.it\/i.test(url) ||
-        /challenges\//i.test(url)
-      ) {
-        const clone = res.clone();
-        clone.json().then((j) => {
-          const qs = extractQuestions(j);
-          if (qs && qs.length) {
-            quizData = qs;
-            status(`quiz yüklendi · ${qs.length} soru`);
-          }
-        }).catch(() => {});
-      }
-    } catch (_) {}
-    return res;
-  };
-
-  // XHR de yakala
-  const _open = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.addEventListener("load", function () {
-      try {
-        if (typeof this.responseText === "string" && /kahoot|challenge|question/i.test(url)) {
-          const j = JSON.parse(this.responseText);
-          const qs = extractQuestions(j);
-          if (qs && qs.length) {
-            quizData = qs;
-            status(`quiz yüklendi · ${qs.length} soru`);
-          }
-        }
-      } catch (_) {}
-    });
-    return _open.call(this, method, url, ...rest);
-  };
-
-  // ─── mini UI ──────────────────────────────────────────────────
-  let statusEl = null;
-  function buildUI() {
-    if (document.getElementById("said-kahoot")) return;
-    const box = document.createElement("div");
-    box.id = "said-kahoot";
-    box.style.cssText = `
-      position:fixed;top:12px;right:12px;z-index:999999;
-      background:rgba(0,0,0,0.88);color:#fff;font:12px/1.3 monospace;
-      padding:10px 12px;border-radius:8px;border:1px solid #222;
-      min-width:200px;max-width:280px;user-select:none;
-    `;
-    box.innerHTML = `
-      <div style="font-weight:700;margin-bottom:6px;">said kahoot</div>
-      <input id="said-kid" placeholder="Quiz ID (uuid)" style="
-        width:100%;box-sizing:border-box;background:#111;border:1px solid #333;
-        color:#fff;padding:6px 8px;border-radius:4px;margin-bottom:6px;font:11px monospace;
-      "/>
-      <button id="said-load" style="
-        width:100%;padding:6px;background:#fff;color:#000;border:none;
-        border-radius:4px;font-weight:700;cursor:pointer;margin-bottom:6px;
-      ">yükle</button>
-      <label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
-        <input type="checkbox" id="said-auto" ${CFG.autoAnswer ? "checked" : ""}/> auto answer
-      </label>
-      <label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
-        <input type="checkbox" id="said-show" ${CFG.showAnswers ? "checked" : ""}/> highlight
-      </label>
-      <div id="said-status" style="color:#8f8;margin-top:6px;font-size:11px;">hazır</div>
-    `;
-    document.documentElement.appendChild(box);
-
-    statusEl = document.getElementById("said-status");
-    document.getElementById("said-auto").onchange = (e) => {
-      CFG.autoAnswer = e.target.checked;
+    // State & "Offsets" (Dynamic Web Hooks)
+    const State = {
+        autoAnswer: false,
+        correctAnswers: [],
+        currentQuestion: 0,
+        quizData: null,
+        menuOpen: true
     };
-    document.getElementById("said-show").onchange = (e) => {
-      CFG.showAnswers = e.target.checked;
-    };
-    document.getElementById("said-load").onclick = async () => {
-      const id = document.getElementById("said-kid").value.trim() || discoverId();
-      if (!id) {
-        status("id yok");
-        return;
-      }
-      status("yükleniyor…");
-      const qs = await fetchByChallengeId(id);
-      if (qs) {
-        quizData = qs;
-        status(`ok · ${qs.length} soru`);
-      } else {
-        status("yüklenemedi (private?)");
-      }
-    };
-  }
 
-  function status(t) {
-    if (statusEl) statusEl.textContent = t;
-  }
+    const Offsets = {
+        apiEndpoint: "/rest/kahoots/",
+        answerNode: "data-functional-selector",
+        buttonPrefix: "answer-"
+    };
 
-  // ─── boot ─────────────────────────────────────────────────────
-  function boot() {
-    buildUI();
-    const id = discoverId();
-    if (id) {
-      document.getElementById("said-kid").value = id;
-      fetchByChallengeId(id).then((qs) => {
-        if (qs) {
-          quizData = qs;
-          status(`auto · ${qs.length} soru`);
-        }
-      });
+    // UI Construction
+    function createMenu() {
+        const menu = document.createElement('div');
+        menu.id = 'said-draggable-menu';
+        menu.style.position = 'fixed';
+        menu.style.top = '20px';
+        menu.style.left = '20px';
+        menu.style.width = '200px';
+        menu.style.backgroundColor = '#050505';
+        menu.style.color = '#ffffff';
+        menu.style.border = '1px solid #333';
+        menu.style.borderRadius = '5px';
+        menu.style.zIndex = '999999';
+        menu.style.fontFamily = 'monospace';
+        menu.style.boxShadow = '0px 0px 10px rgba(0,0,0,0.8)';
+        menu.style.userSelect = 'none';
+
+        // Header (Draggable Area)
+        const header = document.createElement('div');
+        header.style.backgroundColor = '#111';
+        header.style.padding = '8px';
+        header.style.borderBottom = '1px solid #333';
+        header.style.cursor = 'move';
+        header.style.fontWeight = 'bold';
+        header.style.textAlign = 'center';
+        header.innerText = 'Said';
+        
+        // Minimize Button
+        const minBtn = document.createElement('span');
+        minBtn.innerText = '[-]';
+        minBtn.style.float = 'right';
+        minBtn.style.cursor = 'pointer';
+        minBtn.style.color = '#aaa';
+        header.appendChild(minBtn);
+
+        const content = document.createElement('div');
+        content.style.padding = '10px';
+
+        content.innerHTML = `
+            <label style="display: flex; align-items: center; justify-content: space-between; cursor: pointer; font-size: 12px;">
+                <span>Auto-Answer</span>
+                <input type="checkbox" id="said-auto">
+            </label>
+            <div id="said-status" style="margin-top: 10px; font-size: 10px; color: #0f0;">Status: Hooking...</div>
+        `;
+
+        menu.appendChild(header);
+        menu.appendChild(content);
+        document.body.appendChild(menu);
+
+        // Drag Logic
+        let isDragging = false;
+        let offsetX, offsetY;
+
+        header.addEventListener('mousedown', (e) => {
+            if (e.target === minBtn) return;
+            isDragging = true;
+            offsetX = e.clientX - menu.getBoundingClientRect().left;
+            offsetY = e.clientY - menu.getBoundingClientRect().top;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            menu.style.left = (e.clientX - offsetX) + 'px';
+            menu.style.top = (e.clientY - offsetY) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        // Toggle logic
+        minBtn.addEventListener('click', () => {
+            State.menuOpen = !State.menuOpen;
+            content.style.display = State.menuOpen ? 'block' : 'none';
+        });
+
+        document.getElementById('said-auto').addEventListener('change', (e) => {
+            State.autoAnswer = e.target.checked;
+        });
     }
-    setInterval(tick, 400);
-  }
 
-  if (document.body) boot();
-  else document.addEventListener("DOMContentLoaded", boot);
+    // JSON Parser Hook to intercept Quiz Data and correct IDs
+    function hookData() {
+        const originalParse = JSON.parse;
+        JSON.parse = function(text, reviver) {
+            const data = originalParse(text, reviver);
+            try {
+                // Intercept question data payload
+                if (data && data.questions && Array.isArray(data.questions)) {
+                    State.quizData = data;
+                    State.correctAnswers = data.questions.map(q => {
+                        let correctIdxs = [];
+                        if (q.choices) {
+                            q.choices.forEach((choice, idx) => {
+                                if (choice.correct) correctIdxs.push(idx);
+                            });
+                        }
+                        return correctIdxs;
+                    });
+                    
+                    const status = document.getElementById('said-status');
+                    if (status) status.innerText = `Status: Loaded ${data.questions.length} Qs`;
+                }
+            } catch (e) {}
+            return data;
+        };
+
+        // Hook WebSocket to track question progression
+        const OrigWebSocket = window.WebSocket;
+        window.WebSocket = function(...args) {
+            const ws = new OrigWebSocket(...args);
+            ws.addEventListener('message', function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg[0] && msg[0].data && typeof msg[0].data.questionIndex !== 'undefined') {
+                        State.currentQuestion = msg[0].data.questionIndex;
+                        if (State.autoAnswer) {
+                            setTimeout(executeAnswer, 500); // Small delay to let DOM render
+                        }
+                    }
+                } catch (e) {}
+            });
+            return ws;
+        };
+    }
+
+    // Auto-Clicker Logic
+    function executeAnswer() {
+        if (!State.autoAnswer || State.correctAnswers.length === 0) return;
+        
+        let correctIds = State.correctAnswers[State.currentQuestion];
+        if (!correctIds || correctIds.length === 0) return;
+
+        // Kahoot buttons are typically ordered 0-3 (Red, Blue, Yellow, Green)
+        let targetId = correctIds[0];
+        
+        // Find DOM element based on current layout offsets
+        const buttons = document.querySelectorAll(`[${Offsets.answerNode}^="${Offsets.buttonPrefix}"]`);
+        if (buttons.length > targetId) {
+            // Simulate natural click
+            buttons[targetId].click();
+            console.log(`[Said] Auto-clicked answer ID: ${targetId}`);
+        }
+    }
+
+    // DOM Observer for late-rendering buttons
+    const observer = new MutationObserver(() => {
+        if (State.autoAnswer && document.querySelector(`[${Offsets.answerNode}^="${Offsets.buttonPrefix}"]`)) {
+            // Attempt to answer if question screen just rendered
+            if (!document.saidAnswered) {
+                executeAnswer();
+                document.saidAnswered = true;
+                setTimeout(() => { document.saidAnswered = false; }, 5000);
+            }
+        }
+    });
+
+    // Init
+    window.addEventListener('DOMContentLoaded', () => {
+        createMenu();
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+
+    hookData();
+
 })();
