@@ -1,199 +1,454 @@
 // ==UserScript==
-// @name         SAID Kahoot Auto Answer
+// @name         SAID Kahoot Auto Pro
 // @namespace    said
-// @version      1.0
-// @description  Auto correct answers for Kahoot
+// @version      3.0.0
+// @description  Full auto answer — ID hunt, WS, multi-correct, live panel
 // @author       said
 // @match        *://kahoot.it/*
 // @match        *://*.kahoot.it/*
+// @match        *://play.kahoot.it/*
+// @match        *://create.kahoot.it/*
+// @run-at       document-start
 // @grant        none
-// @run-at       document-end
 // ==/UserScript==
 
-(function SAID_KAHOOT() {
+(function () {
   "use strict";
 
-  let answers = []; // questionIndex -> correct choice index(es)
-  let quizId = null;
-  let running = false;
+  const st = {
+    answers: [],       // qIndex -> [choiceIndexes]
+    types: [],         // quiz / truefalse / multiple_select
+    quizId: null,
+    loaded: false,
+    running: true,
+    lastQ: -1,
+    lastClick: 0,
+    pin: null,
+    nickname: null,
+    correctCount: 0,
+    totalAnswered: 0
+  };
 
-  function log(m) {
-    console.log("%c[SAID]%c " + m, "background:#000;color:#0f0;padding:2px 6px", "color:#0f0");
+  function log(m, c) {
+    console.log("%c[SAID]%c " + m, "background:#000;color:#0f0;padding:2px 6px", "color:" + (c || "#0f0"));
   }
 
-  // Quiz UUID ile doğru cevapları çek
+  // ════════════ STATUS UI ════════════
+  function ensureUI() {
+    if (document.getElementById("said-kh")) return;
+    if (!document.body) return setTimeout(ensureUI, 100);
+
+    const box = document.createElement("div");
+    box.id = "said-kh";
+    box.innerHTML = `
+      <div id="said-kh-head">SAID KAHOOT</div>
+      <div id="said-kh-st">başlatılıyor…</div>
+      <div id="said-kh-meta">quiz: —</div>
+      <div id="said-kh-score">0 / 0</div>
+      <div id="said-kh-log"></div>
+      <div id="said-kh-btns">
+        <button id="said-kh-tog">ON</button>
+        <button id="said-kh-clr">log</button>
+      </div>
+    `;
+    const css = document.createElement("style");
+    css.textContent = `
+      #said-kh{position:fixed;top:12px;right:12px;z-index:2147483647;width:240px;
+        background:#050505;border:1px solid #1a1a1a;border-radius:10px;color:#ccc;
+        font:11px/1.4 monospace;box-shadow:0 8px 32px rgba(0,0,0,.8);overflow:hidden}
+      #said-kh-head{padding:10px;text-align:center;letter-spacing:3px;color:#fff;
+        border-bottom:1px solid #151515;font-size:12px}
+      #said-kh-st{padding:8px 10px;color:#0f0;font-size:11px}
+      #said-kh-meta,#said-kh-score{padding:0 10px 6px;color:#555;font-size:10px}
+      #said-kh-log{height:90px;overflow-y:auto;margin:0 8px 8px;padding:6px;
+        background:#0a0a0a;border:1px solid #151515;border-radius:4px;font-size:10px;color:#6f6}
+      #said-kh-btns{display:flex;gap:6px;padding:0 8px 10px}
+      #said-kh-btns button{flex:1;padding:7px;background:#0a0a0a;border:1px solid #222;
+        color:#0f0;cursor:pointer;font:10px monospace;border-radius:4px}
+      #said-kh-btns button.off{color:#f44;border-color:#422}
+    `;
+    document.documentElement.appendChild(css);
+    document.documentElement.appendChild(box);
+
+    document.getElementById("said-kh-tog").onclick = () => {
+      st.running = !st.running;
+      const b = document.getElementById("said-kh-tog");
+      b.textContent = st.running ? "ON" : "OFF";
+      b.classList.toggle("off", !st.running);
+      setStatus(st.running ? "aktif" : "durduruldu");
+    };
+    document.getElementById("said-kh-clr").onclick = () => {
+      const l = document.getElementById("said-kh-log");
+      if (l) l.innerHTML = "";
+    };
+  }
+
+  function setStatus(t) {
+    ensureUI();
+    const el = document.getElementById("said-kh-st");
+    if (el) el.textContent = t;
+  }
+  function setMeta(t) {
+    const el = document.getElementById("said-kh-meta");
+    if (el) el.textContent = t;
+  }
+  function setScore() {
+    const el = document.getElementById("said-kh-score");
+    if (el) el.textContent = st.correctCount + " doğru / " + st.totalAnswered + " cevap";
+  }
+  function addLog(t) {
+    ensureUI();
+    const l = document.getElementById("said-kh-log");
+    if (!l) return;
+    const line = document.createElement("div");
+    line.textContent = t;
+    l.appendChild(line);
+    l.scrollTop = l.scrollHeight;
+  }
+
+  // ════════════ QUIZ ID ════════════
+  function isUuid(s) {
+    return typeof s === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+  }
+
+  function acceptId(id, src) {
+    if (!isUuid(id) || st.quizId === id) return;
+    if (st.loaded && st.quizId) return;
+    st.quizId = id;
+    log("quizId [" + src + "]: " + id);
+    addLog("id · " + id.slice(0, 8) + "…");
+    setMeta("quiz: " + id.slice(0, 8) + "…");
+    loadAnswers(id);
+  }
+
+  function scanText(text, src) {
+    if (!text || typeof text !== "string") return;
+    const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+    let m;
+    while ((m = re.exec(text))) acceptId(m[0], src);
+  }
+
+  function dig(obj, depth, src) {
+    if (!obj || depth > 8) return;
+    if (typeof obj === "string") {
+      if (isUuid(obj)) acceptId(obj, src);
+      else scanText(obj, src);
+      return;
+    }
+    if (typeof obj !== "object") return;
+    for (const k of Object.keys(obj)) {
+      const kl = k.toLowerCase();
+      const v = obj[k];
+      if (typeof v === "string" && (kl.includes("quiz") || kl.includes("kahoot") || kl === "uuid" || kl === "id")) {
+        if (isUuid(v)) acceptId(v, src + "." + k);
+      }
+      dig(v, depth + 1, src);
+    }
+  }
+
+  function findQuizIdPage() {
+    scanText(location.href, "url");
+    try {
+      for (const s of document.scripts) scanText(s.textContent || "", "script");
+    } catch {}
+    try { scanText(document.documentElement.innerHTML.slice(0, 500000), "html"); } catch {}
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        scanText(localStorage.key(i), "ls-k");
+        scanText(localStorage.getItem(localStorage.key(i)), "ls-v");
+      }
+    } catch {}
+    try {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        scanText(sessionStorage.getItem(sessionStorage.key(i)), "ss");
+      }
+    } catch {}
+  }
+
+  // ════════════ NETWORK HOOKS (document-start) ════════════
+  const _fetch = window.fetch;
+  window.fetch = async function (...args) {
+    const res = await _fetch.apply(this, args);
+    try {
+      const url = String(typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "");
+      if (/kahoot|quiz|reserve|session|play|controller|content/i.test(url)) {
+        res.clone().text().then((t) => {
+          scanText(url, "fetch-url");
+          try { dig(JSON.parse(t), 0, "fetch"); } catch { scanText(t, "fetch-raw"); }
+          // canlı soru içeriği
+          try {
+            const data = JSON.parse(t);
+            parseLiveQuestion(data);
+          } catch {}
+        }).catch(() => {});
+      }
+    } catch {}
+    return res;
+  };
+
+  const _open = XMLHttpRequest.prototype.open;
+  const _send = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__saidUrl = url;
+    return _open.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function () {
+    this.addEventListener("load", function () {
+      try {
+        const url = String(this.__saidUrl || "");
+        if (!/kahoot|quiz|session|play|content/i.test(url)) return;
+        scanText(url, "xhr-url");
+        const t = this.responseText || "";
+        try { dig(JSON.parse(t), 0, "xhr"); } catch { scanText(t, "xhr-raw"); }
+        try { parseLiveQuestion(JSON.parse(t)); } catch {}
+      } catch {}
+    });
+    return _send.apply(this, arguments);
+  };
+
+  // WebSocket — canlı oyun eventleri
+  const _WS = window.WebSocket;
+  window.WebSocket = function (url, protocols) {
+    const ws = protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
+    try {
+      scanText(String(url), "ws-url");
+      ws.addEventListener("message", (ev) => {
+        try {
+          const raw = typeof ev.data === "string" ? ev.data : "";
+          if (!raw) return;
+          scanText(raw, "ws");
+          let data;
+          try { data = JSON.parse(raw); } catch { return; }
+          const arr = Array.isArray(data) ? data : [data];
+          for (const msg of arr) {
+            if (!msg) continue;
+            if (msg.data) {
+              dig(msg.data, 0, "ws-data");
+              let content = msg.data.content;
+              if (typeof content === "string") {
+                try { content = JSON.parse(content); } catch {}
+              }
+              if (content) {
+                dig(content, 0, "ws-content");
+                parseLiveQuestion(content, msg.data);
+              }
+              // quizId host paketinde
+              if (msg.data.id === 10 || msg.data.id === 13 || msg.data.id === 14) {
+                parseLiveQuestion(content || msg.data, msg.data);
+              }
+            }
+          }
+        } catch {}
+      });
+    } catch {}
+    return ws;
+  };
+  window.WebSocket.prototype = _WS.prototype;
+  Object.assign(window.WebSocket, _WS);
+
+  // ════════════ ANSWER LOAD ════════════
   async function loadAnswers(uuid) {
-    answers = [];
     if (!uuid) return false;
     const urls = [
       "https://create.kahoot.it/rest/kahoots/" + uuid,
-      "https://kahoot.it/rest/kahoots/" + uuid
+      "https://kahoot.it/rest/kahoots/" + uuid,
+      "https://play.kahoot.it/rest/kahoots/" + uuid
     ];
     for (const u of urls) {
       try {
-        const r = await fetch(u, { headers: { Accept: "application/json" } });
+        const r = await _fetch(u, {
+          headers: { Accept: "application/json" },
+          credentials: "omit"
+        });
         if (!r.ok) continue;
         const data = await r.json();
-        if (!data.questions) continue;
-        answers = data.questions.map((q) => {
+        if (!data.questions || !data.questions.length) continue;
+
+        st.answers = data.questions.map((q) => {
           if (!q.choices) return [0];
           const correct = [];
           q.choices.forEach((c, i) => { if (c.correct) correct.push(i); });
           return correct.length ? correct : [0];
         });
-        log("Yüklendi: " + answers.length + " soru");
+        st.types = data.questions.map((q) => q.type || "quiz");
+        st.loaded = true;
+        st.quizId = uuid;
+        log("YÜKLENDİ " + st.answers.length + " soru", "#0f0");
+        addLog("yüklendi · " + st.answers.length + " soru");
+        setStatus("hazır · " + st.answers.length + " soru");
+        setMeta("quiz: " + uuid.slice(0, 8) + "… · " + (data.title || "").slice(0, 20));
         return true;
       } catch {}
     }
-    log("Quiz verisi alınamadı");
+    setStatus("gizli quiz · rastgele + live");
+    addLog("api yok · live dinleniyor");
     return false;
   }
 
-  // URL / sayfadan quizId yakala
-  function findQuizId() {
-    const href = location.href;
-    let m = href.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-    if (m) return m[0];
-    m = href.match(/quizId=([0-9a-f-]+)/i);
-    if (m) return m[1];
+  // canlı paketten doğru şık çıkar (bazı host paketlerinde gelir)
+  function parseLiveQuestion(content, parent) {
+    if (!content || typeof content !== "object") return;
     try {
-      const scripts = document.querySelectorAll("script");
-      for (const s of scripts) {
-        const t = s.textContent || "";
-        const mm = t.match(/"uuid"\s*:\s*"([0-9a-f-]{36})"/i);
-        if (mm) return mm[1];
+      // questionIndex
+      const qi = content.questionIndex;
+      if (typeof qi !== "number") return;
+
+      // choices with correct flag
+      if (Array.isArray(content.choices)) {
+        const correct = [];
+        content.choices.forEach((c, i) => {
+          if (c && c.correct) correct.push(i);
+        });
+        if (correct.length) {
+          st.answers[qi] = correct;
+          st.loaded = true;
+          addLog("live cevap Q" + (qi + 1) + " → " + correct.join(","));
+        }
+      }
+
+      // quizQuestionAnswers: array of answer counts / sometimes correct map
+      if (content.quizQuestionAnswers && !st.answers[qi]) {
+        // sadece şık sayısı — doğru bilmiyoruz
       }
     } catch {}
-    return null;
   }
 
-  // Ekrandaki şıklara tıkla (DOM auto answer)
-  function clickChoice(index) {
-    // Kahoot buton sırası: 0 kırmızı, 1 mavi, 2 sarı, 3 yeşil
-    const selectors = [
-      '[data-functional-selector="answer-0"]',
-      '[data-functional-selector="answer-1"]',
-      '[data-functional-selector="answer-2"]',
-      '[data-functional-selector="answer-3"]',
-      'button[data-testid="answer-0"]',
-      'button[data-testid="answer-1"]',
-      'button[data-testid="answer-2"]',
-      'button[data-testid="answer-3"]'
+  // ════════════ DOM CLICK ════════════
+  function choiceButtons() {
+    const sels = [
+      '[data-functional-selector^="answer-"]',
+      '[data-testid^="answer-"]',
+      'button[data-functional-selector*="answer"]',
+      '[class*="question__choices"] button',
+      '[class*="choices"] > button',
+      '[class*="answer-buttons"] button'
     ];
-
-    // önce data-functional
-    let btn = document.querySelector('[data-functional-selector="answer-' + index + '"]');
-    if (!btn) {
-      const all = document.querySelectorAll('[data-functional-selector^="answer-"]');
-      if (all[index]) btn = all[index];
+    for (const s of sels) {
+      const nodes = document.querySelectorAll(s);
+      if (nodes.length >= 2) return Array.from(nodes);
     }
-    if (!btn) {
-      const choices = document.querySelectorAll('[class*="choice"], [class*="answer-button"], button[class*="answer"]');
-      if (choices[index]) btn = choices[index];
-    }
-    if (btn) {
-      btn.click();
-      log("Tıklandı şık " + index);
-      return true;
-    }
-    return false;
+    // fallback: görünür büyük butonlar
+    const btns = Array.from(document.querySelectorAll("button")).filter((b) => {
+      const r = b.getBoundingClientRect();
+      return r.width > 80 && r.height > 40 && r.top > 80;
+    });
+    return btns.length >= 2 ? btns : [];
   }
 
-  let lastQ = -1;
+  function clickIndex(index) {
+    const btns = choiceButtons();
+    if (!btns.length) return false;
+    const btn = btns[index] || btns[0];
+    if (!btn) return false;
+    try {
+      btn.focus();
+      btn.click();
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    } catch {
+      btn.click();
+    }
+    return true;
+  }
+
+  function clickMany(indexes) {
+    let ok = false;
+    for (const i of indexes) {
+      if (clickIndex(i)) ok = true;
+    }
+    // multi-select submit
+    if (indexes.length > 1) {
+      const submit =
+        document.querySelector('[data-functional-selector="submit-button"]') ||
+        document.querySelector('button[class*="submit"]') ||
+        Array.from(document.querySelectorAll("button")).find((b) =>
+          /submit|gönder|ok|confirm/i.test(b.textContent || "")
+        );
+      if (submit) setTimeout(() => submit.click(), 120);
+    }
+    return ok;
+  }
+
+  function getQuestionIndex() {
+    const sels = [
+      '[data-functional-selector="question-index"]',
+      '[data-functional-selector*="question-count"]',
+      '[class*="question-count"]',
+      '[class*="top-bar"] [class*="counter"]'
+    ];
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      if (!el) continue;
+      const nums = (el.textContent || "").match(/\d+/g);
+      if (nums && nums.length) return parseInt(nums[0], 10) - 1;
+    }
+    return Math.max(0, st.lastQ + 1);
+  }
 
   function tryAnswer() {
-    if (!running) return;
+    if (!st.running) return;
+    const btns = choiceButtons();
+    if (btns.length < 2) return;
 
-    // soru numarası / index bul
-    let qIndex = lastQ + 1;
-    try {
-      const counter = document.querySelector('[data-functional-selector="question-index"]') ||
-        document.querySelector('[class*="question-count"]');
-      if (counter) {
-        const t = counter.textContent || "";
-        const mm = t.match(/(\d+)/);
-        if (mm) qIndex = parseInt(mm[1], 10) - 1;
-      }
-    } catch {}
+    const now = Date.now();
+    if (now - st.lastClick < 400) return;
 
-    if (qIndex === lastQ) return;
+    let qIndex = getQuestionIndex();
+    if (qIndex < 0) qIndex = 0;
+    if (qIndex === st.lastQ) return;
 
-    // şıklar görünür mü
-    const hasChoices =
-      document.querySelector('[data-functional-selector^="answer-"]') ||
-      document.querySelectorAll('button[class*="answer"]').length >= 2;
-
-    if (!hasChoices) return;
-
-    let choice = 0;
-    if (answers[qIndex] && answers[qIndex].length) {
-      choice = answers[qIndex][0];
-    } else {
-      choice = Math.floor(Math.random() * 4);
+    let choices = st.answers[qIndex];
+    if (!choices || !choices.length) {
+      choices = [Math.floor(Math.random() * Math.min(4, btns.length))];
     }
 
-    const delay = 300 + Math.random() * 900;
+    // sınırla
+    choices = choices.filter((i) => i >= 0 && i < btns.length);
+    if (!choices.length) choices = [0];
+
+    const delay = 180 + Math.random() * 520;
     setTimeout(() => {
-      if (clickChoice(choice)) lastQ = qIndex;
+      if (!st.running) return;
+      if (choiceButtons().length < 2) return;
+      if (clickMany(choices)) {
+        st.lastQ = qIndex;
+        st.lastClick = Date.now();
+        st.totalAnswered++;
+        if (st.answers[qIndex] && st.answers[qIndex].length) st.correctCount++;
+        setScore();
+        setStatus("Q" + (qIndex + 1) + " → " + choices.join(","));
+        addLog("Q" + (qIndex + 1) + " şık " + choices.join(","));
+        log("cevap Q" + (qIndex + 1) + " " + choices.join(","));
+      }
     }, delay);
   }
 
-  // SAID mini menü
-  function menu() {
-    if (document.getElementById("said-kh")) return;
-    const d = document.createElement("div");
-    d.id = "said-kh";
-    d.style.cssText = [
-      "position:fixed", "top:12px", "right:12px", "z-index:999999",
-      "background:#000", "color:#0f0", "border:1px solid #222",
-      "padding:12px", "font:12px monospace", "border-radius:8px",
-      "width:240px"
-    ].join(";");
-    d.innerHTML = `
-      <div style="letter-spacing:3px;text-align:center;margin-bottom:8px;color:#fff">SAID</div>
-      <input id="said-uuid" placeholder="Quiz UUID" style="width:100%;margin:4px 0;padding:6px;background:#111;color:#fff;border:1px solid #333">
-      <button id="said-start" style="width:100%;padding:8px;margin-top:4px;background:#111;color:#0f0;border:1px solid #0f0;cursor:pointer">AUTO ON</button>
-      <button id="said-stop" style="width:100%;padding:8px;margin-top:4px;background:#111;color:#f44;border:1px solid #f44;cursor:pointer">OFF</button>
-      <div id="said-st" style="margin-top:6px;font-size:10px;color:#666">kapalı</div>
-    `;
-    document.body.appendChild(d);
-
-    document.getElementById("said-start").onclick = async () => {
-      const input = document.getElementById("said-uuid").value.trim();
-      quizId = input || findQuizId();
-      if (quizId) {
-        document.getElementById("said-uuid").value = quizId;
-        await loadAnswers(quizId);
-      } else {
-        log("UUID yok — rastgele cevap");
-      }
-      running = true;
-      lastQ = -1;
-      document.getElementById("said-st").textContent = "aktif · auto answer";
-      log("Auto answer AÇIK");
-    };
-
-    document.getElementById("said-stop").onclick = () => {
-      running = false;
-      document.getElementById("said-st").textContent = "kapalı";
-      log("Kapalı");
-    };
-  }
-
-  // MutationObserver — soru değişince cevapla
-  const obs = new MutationObserver(() => tryAnswer());
+  // ════════════ LOOP ════════════
   function boot() {
-    menu();
-    obs.observe(document.body, { childList: true, subtree: true });
-    setInterval(tryAnswer, 800);
-    const autoId = findQuizId();
-    if (autoId) {
-      document.getElementById("said-uuid").value = autoId;
-      loadAnswers(autoId);
-    }
-    log("SAID Kahoot yüklendi");
+    ensureUI();
+    setStatus("tarama…");
+    log("SAID Kahoot Pro v3");
+
+    findQuizIdPage();
+    setInterval(findQuizIdPage, 2000);
+    setInterval(tryAnswer, 450);
+
+    const obs = new MutationObserver(() => {
+      tryAnswer();
+      ensureUI();
+    });
+    const watch = () => {
+      if (document.body) {
+        obs.observe(document.body, { childList: true, subtree: true, attributes: true });
+        ensureUI();
+      } else setTimeout(watch, 100);
+    };
+    watch();
   }
 
-  if (document.body) boot();
-  else document.addEventListener("DOMContentLoaded", boot);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else boot();
+  // document-start erken UI
+  setTimeout(ensureUI, 300);
 })();
